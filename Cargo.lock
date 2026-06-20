@@ -1383,6 +1383,7 @@ dependencies = [
  "env_logger",
  "etcetera",
  "git2",
+ "globset",
  "grep-searcher",
  "hex",
  "ignore",

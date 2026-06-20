@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState::Continue};
 
 use rayon::prelude::*;
@@ -11,13 +12,53 @@ use crate::{
 
 const IGNORE_FILE: &str = ".tokeignore";
 
-fn is_path_excluded(entry_path: &Path, excluded_patterns: &[String]) -> bool {
-    entry_path.components().any(|comp| {
-        let comp_str = comp.as_os_str().to_string_lossy();
-        excluded_patterns
-            .iter()
-            .any(|pattern| comp_str.eq_ignore_ascii_case(pattern))
-    })
+struct ExcludeMatcher {
+    component_set: GlobSet,
+    path_set: GlobSet,
+}
+
+impl ExcludeMatcher {
+    fn new(patterns: &[&str]) -> Result<Self, globset::Error> {
+        let mut component_builder = GlobSetBuilder::new();
+        let mut path_builder = GlobSetBuilder::new();
+
+        for pattern in patterns {
+            if pattern.contains('/') {
+                let glob = GlobBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()?;
+                path_builder.add(glob);
+
+                let prefixed = format!("**/{}", pattern.trim_start_matches('/'));
+                let glob_prefixed = GlobBuilder::new(&prefixed)
+                    .case_insensitive(true)
+                    .build()?;
+                path_builder.add(glob_prefixed);
+            } else {
+                let glob = GlobBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .literal_separator(true)
+                    .build()?;
+                component_builder.add(glob);
+            }
+        }
+
+        Ok(Self {
+            component_set: component_builder.build()?,
+            path_set: path_builder.build()?,
+        })
+    }
+
+    fn is_excluded(&self, path: &Path) -> bool {
+        for component in path.components() {
+            let comp_str = component.as_os_str().to_string_lossy();
+            if self.component_set.is_match(comp_str.as_ref()) {
+                return true;
+            }
+        }
+
+        self.path_set.is_match(path)
+    }
 }
 
 pub fn get_all_files<A: AsRef<Path>>(
@@ -37,8 +78,15 @@ pub fn get_all_files<A: AsRef<Path>>(
     }
 
     if !ignored_directories.is_empty() {
-        let excluded: Vec<String> = ignored_directories.iter().map(|s| s.to_string()).collect();
-        walker.filter_entry(move |entry| !is_path_excluded(entry.path(), &excluded));
+        let matcher = ExcludeMatcher::new(ignored_directories)
+            .unwrap_or_else(|e| {
+                error!("Invalid exclude pattern: {}", e);
+                ExcludeMatcher {
+                    component_set: GlobSetBuilder::new().build().unwrap(),
+                    path_set: GlobSetBuilder::new().build().unwrap(),
+                }
+            });
+        walker.filter_entry(move |entry| !matcher.is_excluded(entry.path()));
     }
 
     let ignore = config.no_ignore.map(|b| !b).unwrap_or(true);
@@ -605,5 +653,173 @@ mod tests {
 
         let rust = languages.get(LANGUAGE).expect("Rust should exist");
         assert_eq!(rust.reports.len(), 1);
+    }
+
+    #[test]
+    fn exclude_glob_prefix() {
+        let dir = TempDir::new().expect("Couldn't create temp dir.");
+        let config = Config::default();
+        let mut languages = Languages::new();
+
+        let test_foo_dir = dir.path().join("test_foo");
+        let test_bar_dir = dir.path().join("test_bar");
+        let src_dir = dir.path().join("src");
+        fs::create_dir(&test_foo_dir).expect("Couldn't create test_foo dir");
+        fs::create_dir(&test_bar_dir).expect("Couldn't create test_bar dir");
+        fs::create_dir(&src_dir).expect("Couldn't create src dir");
+        fs::write(dir.path().join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(test_foo_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(test_bar_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(src_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+
+        super::get_all_files(
+            &[dir.path().to_str().unwrap()],
+            &["test_*"],
+            &mut languages,
+            &config,
+        );
+
+        let rust = languages.get(LANGUAGE).expect("Rust should exist");
+        assert_eq!(rust.reports.len(), 2);
+        for report in &rust.reports {
+            assert!(!report
+                .name
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("test_"));
+        }
+    }
+
+    #[test]
+    fn exclude_glob_suffix() {
+        let dir = TempDir::new().expect("Couldn't create temp dir.");
+        let config = Config::default();
+        let mut languages = Languages::new();
+
+        let foo_test_dir = dir.path().join("foo_test");
+        let bar_test_dir = dir.path().join("bar_test");
+        let src_dir = dir.path().join("src");
+        fs::create_dir(&foo_test_dir).expect("Couldn't create foo_test dir");
+        fs::create_dir(&bar_test_dir).expect("Couldn't create bar_test dir");
+        fs::create_dir(&src_dir).expect("Couldn't create src dir");
+        fs::write(dir.path().join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(foo_test_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(bar_test_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(src_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+
+        super::get_all_files(
+            &[dir.path().to_str().unwrap()],
+            &["*_test"],
+            &mut languages,
+            &config,
+        );
+
+        let rust = languages.get(LANGUAGE).expect("Rust should exist");
+        assert_eq!(rust.reports.len(), 2);
+        for report in &rust.reports {
+            assert!(!report
+                .name
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("_test"));
+        }
+    }
+
+    #[test]
+    fn exclude_glob_single_char() {
+        let dir = TempDir::new().expect("Couldn't create temp dir.");
+        let config = Config::default();
+        let mut languages = Languages::new();
+
+        let test1_dir = dir.path().join("test1");
+        let test2_dir = dir.path().join("test2");
+        let test_dir = dir.path().join("test");
+        fs::create_dir(&test1_dir).expect("Couldn't create test1 dir");
+        fs::create_dir(&test2_dir).expect("Couldn't create test2 dir");
+        fs::create_dir(&test_dir).expect("Couldn't create test dir");
+        fs::write(dir.path().join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(test1_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(test2_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(test_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+
+        super::get_all_files(
+            &[dir.path().to_str().unwrap()],
+            &["test?"],
+            &mut languages,
+            &config,
+        );
+
+        let rust = languages.get(LANGUAGE).expect("Rust should exist");
+        assert_eq!(rust.reports.len(), 2);
+    }
+
+    #[test]
+    fn exclude_glob_path_pattern() {
+        let dir = TempDir::new().expect("Couldn't create temp dir.");
+        let config = Config::default();
+        let mut languages = Languages::new();
+
+        let src_vendor_dir = dir.path().join("src/vendor");
+        let lib_vendor_dir = dir.path().join("lib/vendor");
+        let src_dir = dir.path().join("src");
+        let lib_dir = dir.path().join("lib");
+        fs::create_dir_all(&src_vendor_dir).expect("Couldn't create src/vendor dir");
+        fs::create_dir_all(&lib_vendor_dir).expect("Couldn't create lib/vendor dir");
+        fs::write(dir.path().join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(src_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(lib_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(src_vendor_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(lib_vendor_dir.join(FILE_NAME), FILE_CONTENTS).unwrap();
+
+        super::get_all_files(
+            &[dir.path().to_str().unwrap()],
+            &["*/vendor"],
+            &mut languages,
+            &config,
+        );
+
+        let rust = languages.get(LANGUAGE).expect("Rust should exist");
+        assert_eq!(rust.reports.len(), 3);
+        for report in &rust.reports {
+            let path_str = report.name.to_string_lossy();
+            assert!(!path_str.contains("vendor"));
+        }
+    }
+
+    #[test]
+    fn exclude_glob_nested_all_levels() {
+        let dir = TempDir::new().expect("Couldn't create temp dir.");
+        let config = Config::default();
+        let mut languages = Languages::new();
+
+        let node_modules1 = dir.path().join("node_modules");
+        let node_modules2 = dir.path().join("src/node_modules");
+        let node_modules3 = dir.path().join("src/lib/node_modules");
+        fs::create_dir_all(&node_modules1).expect("Couldn't create node_modules dir");
+        fs::create_dir_all(&node_modules2).expect("Couldn't create src/node_modules dir");
+        fs::create_dir_all(&node_modules3).expect("Couldn't create src/lib/node_modules dir");
+        fs::write(dir.path().join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(dir.path().join("src").join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(node_modules1.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(node_modules2.join(FILE_NAME), FILE_CONTENTS).unwrap();
+        fs::write(node_modules3.join(FILE_NAME), FILE_CONTENTS).unwrap();
+
+        super::get_all_files(
+            &[dir.path().to_str().unwrap()],
+            &["node_modules"],
+            &mut languages,
+            &config,
+        );
+
+        let rust = languages.get(LANGUAGE).expect("Rust should exist");
+        assert_eq!(rust.reports.len(), 2);
+        for report in &rust.reports {
+            assert!(!report
+                .name
+                .components()
+                .any(|c| c.as_os_str() == "node_modules"));
+        }
     }
 }
