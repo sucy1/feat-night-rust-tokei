@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, path::Path};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState::Continue};
 
 use rayon::prelude::*;
@@ -12,52 +11,78 @@ use crate::{
 
 const IGNORE_FILE: &str = ".tokeignore";
 
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.chars().collect::<Vec<_>>();
+    let t = text.chars().collect::<Vec<_>>();
+    let pn = p.len();
+    let tn = t.len();
+
+    let mut dp = vec![vec![false; tn + 1]; pn + 1];
+    dp[0][0] = true;
+
+    for i in 1..=pn {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        } else {
+            break;
+        }
+    }
+
+    for i in 1..=pn {
+        for j in 1..=tn {
+            if p[i - 1] == '*' {
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if p[i - 1] == '?' || p[i - 1].eq_ignore_ascii_case(&t[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+
+    dp[pn][tn]
+}
+
 struct ExcludeMatcher {
-    component_set: GlobSet,
-    path_set: GlobSet,
+    component_patterns: Vec<String>,
+    path_patterns: Vec<String>,
 }
 
 impl ExcludeMatcher {
-    fn new(patterns: &[&str]) -> Result<Self, globset::Error> {
-        let mut component_builder = GlobSetBuilder::new();
-        let mut path_builder = GlobSetBuilder::new();
+    fn new(patterns: &[&str]) -> Self {
+        let mut component_patterns = Vec::new();
+        let mut path_patterns = Vec::new();
 
         for pattern in patterns {
             if pattern.contains('/') {
-                let glob = GlobBuilder::new(pattern)
-                    .case_insensitive(true)
-                    .build()?;
-                path_builder.add(glob);
-
-                let prefixed = format!("**/{}", pattern.trim_start_matches('/'));
-                let glob_prefixed = GlobBuilder::new(&prefixed)
-                    .case_insensitive(true)
-                    .build()?;
-                path_builder.add(glob_prefixed);
+                path_patterns.push(pattern.trim_start_matches('/').to_string());
             } else {
-                let glob = GlobBuilder::new(pattern)
-                    .case_insensitive(true)
-                    .literal_separator(true)
-                    .build()?;
-                component_builder.add(glob);
+                component_patterns.push(pattern.to_string());
             }
         }
 
-        Ok(Self {
-            component_set: component_builder.build()?,
-            path_set: path_builder.build()?,
-        })
+        Self {
+            component_patterns,
+            path_patterns,
+        }
     }
 
     fn is_excluded(&self, path: &Path) -> bool {
         for component in path.components() {
             let comp_str = component.as_os_str().to_string_lossy();
-            if self.component_set.is_match(comp_str.as_ref()) {
+            for pattern in &self.component_patterns {
+                if wildcard_match(pattern, &comp_str) {
+                    return true;
+                }
+            }
+        }
+
+        let path_str = path.to_string_lossy();
+        for pattern in &self.path_patterns {
+            if wildcard_match(pattern, &path_str) {
                 return true;
             }
         }
 
-        self.path_set.is_match(path)
+        false
     }
 }
 
@@ -78,14 +103,7 @@ pub fn get_all_files<A: AsRef<Path>>(
     }
 
     if !ignored_directories.is_empty() {
-        let matcher = ExcludeMatcher::new(ignored_directories)
-            .unwrap_or_else(|e| {
-                error!("Invalid exclude pattern: {}", e);
-                ExcludeMatcher {
-                    component_set: GlobSetBuilder::new().build().unwrap(),
-                    path_set: GlobSetBuilder::new().build().unwrap(),
-                }
-            });
+        let matcher = ExcludeMatcher::new(ignored_directories);
         walker.filter_entry(move |entry| !matcher.is_excluded(entry.path()));
     }
 
@@ -183,6 +201,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::IGNORE_FILE;
+    use super::wildcard_match;
     use crate::{
         config::Config,
         language::{languages::Languages, LanguageType},
@@ -192,6 +211,41 @@ mod tests {
     const FILE_NAME: &str = "main.rs";
     const IGNORE_PATTERN: &str = "*.rs";
     const LANGUAGE: &LanguageType = &LanguageType::Rust;
+
+    #[test]
+    fn wildcard_match_exact() {
+        assert!(wildcard_match("vendor", "vendor"));
+        assert!(!wildcard_match("vendor", "vendors"));
+    }
+
+    #[test]
+    fn wildcard_match_star() {
+        assert!(wildcard_match("test_*", "test_foo"));
+        assert!(wildcard_match("test_*", "test_"));
+        assert!(wildcard_match("*_test", "foo_test"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(!wildcard_match("test_*", "prod_foo"));
+    }
+
+    #[test]
+    fn wildcard_match_question() {
+        assert!(wildcard_match("test?", "test1"));
+        assert!(!wildcard_match("test?", "test"));
+        assert!(!wildcard_match("test?", "test12"));
+    }
+
+    #[test]
+    fn wildcard_match_case_insensitive() {
+        assert!(wildcard_match("vendor", "Vendor"));
+        assert!(wildcard_match("TEST_*", "test_foo"));
+    }
+
+    #[test]
+    fn wildcard_match_path() {
+        assert!(wildcard_match("*/vendor", "src/vendor"));
+        assert!(wildcard_match("*/vendor", "lib/vendor"));
+        assert!(!wildcard_match("*/vendor", "src/lib"));
+    }
 
     #[test]
     fn ignore_directory_with_extension() {
