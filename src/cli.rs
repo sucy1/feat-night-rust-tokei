@@ -313,7 +313,9 @@ impl Cli {
     pub fn ignored_directories(&self) -> Vec<&str> {
         let mut ignored_directories: Vec<&str> = Vec::new();
         if let Some(user_ignored) = self.matches.get_many::<String>("exclude") {
-            ignored_directories.extend(user_ignored.map(|x| x.as_str()));
+            ignored_directories.extend(
+                user_ignored.flat_map(|x| x.split(',').collect::<Vec<_>>())
+            );
         }
         ignored_directories
     }
